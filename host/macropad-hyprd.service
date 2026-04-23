@@ -1,0 +1,13 @@
+[Unit]
+Description=Macropad Hyprland workspace indicator
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/Development/omarchy-macropad/host/macropad-hyprd
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

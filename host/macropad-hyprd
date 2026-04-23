@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""Bridge Hyprland workspace state to the Adafruit Macropad LEDs.
+
+Listens on Hyprland's event socket, recomputes per-workspace state on each
+relevant event, and pushes a 7-byte frame (`Sxxxxxx\n`) over the macropad's
+USB CDC data port. Each digit encodes one workspace slot:
+  '0' empty, '1' occupied (has windows), '2' active on focused monitor.
+"""
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+
+WORKSPACES = (1, 2, 3, 4, 5, 6)
+
+RELEVANT_EVENTS = {
+    "workspace",
+    "focusedmon",
+    "activewindow",
+    "activewindowv2",
+    "openwindow",
+    "closewindow",
+    "movewindow",
+    "movewindowv2",
+    "createworkspace",
+    "destroyworkspace",
+    "moveworkspace",
+}
+
+TTY_CANDIDATES = ["/dev/macropad"] + [f"/dev/ttyACM{i}" for i in range(10)]
+
+
+def log(msg):
+    print(f"macropad-hyprd: {msg}", file=sys.stderr, flush=True)
+
+
+def hyprctl_json(what):
+    out = subprocess.check_output(["hyprctl", "-j", what], timeout=2)
+    return json.loads(out)
+
+
+def compute_frame():
+    monitors = hyprctl_json("monitors")
+    workspaces = hyprctl_json("workspaces")
+    focused = next((m for m in monitors if m.get("focused")), None)
+    active_id = focused.get("activeWorkspace", {}).get("id") if focused else None
+    occupied = {w["id"] for w in workspaces if w.get("windows", 0) > 0}
+    digits = []
+    for wid in WORKSPACES:
+        if wid == active_id:
+            digits.append("2")
+        elif wid in occupied:
+            digits.append("1")
+        else:
+            digits.append("0")
+    return ("S" + "".join(digits) + "\n").encode()
+
+
+class MacropadLink:
+    def __init__(self):
+        self.fd = None
+        self.path = None
+
+    def _open(self):
+        for path in TTY_CANDIDATES:
+            if os.path.exists(path):
+                try:
+                    self.fd = open(path, "wb", buffering=0)
+                    self.path = path
+                    log(f"opened {path}")
+                    return True
+                except OSError as e:
+                    log(f"open {path} failed: {e}")
+        return False
+
+    def _close(self):
+        if self.fd is not None:
+            try:
+                self.fd.close()
+            except OSError:
+                pass
+        self.fd = None
+        self.path = None
+
+    def write(self, data):
+        if self.fd is None and not self._open():
+            return
+        try:
+            self.fd.write(data)
+        except OSError as e:
+            log(f"write {self.path} failed: {e}")
+            self._close()
+
+
+def connect_event_socket():
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if not sig:
+        raise RuntimeError("HYPRLAND_INSTANCE_SIGNATURE not set")
+    xdg = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    path = f"{xdg}/hypr/{sig}/.socket2.sock"
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(path)
+    return sock
+
+
+def push(link):
+    try:
+        link.write(compute_frame())
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError) as e:
+        log(f"hyprctl failed: {e}")
+
+
+def run():
+    link = MacropadLink()
+    while True:
+        try:
+            sock = connect_event_socket()
+        except (FileNotFoundError, ConnectionRefusedError, RuntimeError) as e:
+            log(f"waiting for Hyprland: {e}")
+            time.sleep(2)
+            continue
+
+        push(link)
+        buf = b""
+        try:
+            while True:
+                data = sock.recv(4096)
+                if not data:
+                    break
+                buf += data
+                dirty = False
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    event = line.split(b">>", 1)[0].decode(errors="replace")
+                    if event in RELEVANT_EVENTS:
+                        dirty = True
+                if dirty:
+                    push(link)
+        except OSError as e:
+            log(f"event socket error: {e}")
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        time.sleep(1)
+
+
+if __name__ == "__main__":
+    try:
+        run()
+    except KeyboardInterrupt:
+        pass

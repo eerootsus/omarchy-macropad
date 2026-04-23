@@ -1,0 +1,4 @@
+# Adafruit Macropad RP2040 (CircuitPython with CDC data enabled).
+# Creates /dev/macropad pointing at the data serial interface (interface 2).
+# Verify VID/PID with `lsusb` after replugging — adjust idProduct if yours differs.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="239a", ATTRS{idProduct}=="8107", ENV{ID_USB_INTERFACE_NUM}=="02", SYMLINK+="macropad", GROUP="uucp", MODE="0660"
