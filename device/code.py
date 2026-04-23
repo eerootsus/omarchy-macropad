@@ -7,7 +7,7 @@ macropad.pixels.brightness = 0.3
 macropad.pixels.auto_write = False
 
 OFF = (0, 0, 0)
-ORANGE = (255, 90, 0)
+GREEN = (40, 220, 20)
 WHITE = (255, 255, 255)
 
 # Top two rows of the 3x4 grid map to workspaces 1..6.
@@ -24,7 +24,7 @@ KEYCODES = (
 
 STATE_COLORS = {
     ord("0"): OFF,
-    ord("1"): ORANGE,
+    ord("1"): GREEN,
     ord("2"): WHITE,
 }
 
