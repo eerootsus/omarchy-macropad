@@ -1,4 +1,5 @@
 import usb_cdc
+from adafruit_hid.consumer_control_code import ConsumerControlCode
 from adafruit_hid.keycode import Keycode
 from adafruit_macropad import MacroPad
 
@@ -9,19 +10,24 @@ macropad.pixels.auto_write = False
 # Brightness is encoded directly in the tuples: 255 = 100% on that channel.
 ACTIVE = (128, 0, 0)     # focused workspace — red @ 50%
 OCCUPIED = (0, 0, 128)   # has windows — blue @ 50%
-MAPPED = (0, 0, 20)      # empty but bound — very dim blue, visible as a "this key does something" hint
+MAPPED = (0, 0, 20)      # empty but bound — very dim blue
+UTILITY = (25, 12, 0)    # copy/paste "mapped" hint — dim amber, contrasts with workspace blue
 
 # Top two rows of the 3x4 grid map to workspaces 1..6.
 WORKSPACE_KEYS = (0, 1, 2, 3, 4, 5)
+COPY_KEY = 9
+PASTE_KEY = 10
 
-KEYCODES = (
-    (Keycode.GUI, Keycode.ONE),
-    (Keycode.GUI, Keycode.TWO),
-    (Keycode.GUI, Keycode.THREE),
-    (Keycode.GUI, Keycode.FOUR),
-    (Keycode.GUI, Keycode.FIVE),
-    (Keycode.GUI, Keycode.SIX),
-)
+KEYCODES = {
+    0: (Keycode.GUI, Keycode.ONE),
+    1: (Keycode.GUI, Keycode.TWO),
+    2: (Keycode.GUI, Keycode.THREE),
+    3: (Keycode.GUI, Keycode.FOUR),
+    4: (Keycode.GUI, Keycode.FIVE),
+    5: (Keycode.GUI, Keycode.SIX),
+    COPY_KEY: (Keycode.CONTROL, Keycode.SHIFT, Keycode.C),
+    PASTE_KEY: (Keycode.CONTROL, Keycode.SHIFT, Keycode.V),
+}
 
 STATE_COLORS = {
     ord("0"): MAPPED,
@@ -33,6 +39,8 @@ STATE_COLORS = {
 def paint(states):
     for i, key in enumerate(WORKSPACE_KEYS):
         macropad.pixels[key] = STATE_COLORS.get(states[i], MAPPED)
+    macropad.pixels[COPY_KEY] = UTILITY
+    macropad.pixels[PASTE_KEY] = UTILITY
     macropad.pixels.show()
 
 
@@ -40,13 +48,28 @@ paint(b"000000")
 
 serial = usb_cdc.data
 buf = b""
+last_encoder = macropad.encoder
+last_switch = macropad.encoder_switch
 
 while True:
     event = macropad.keys.events.get()
     if event and event.pressed:
-        idx = event.key_number
-        if 0 <= idx < len(KEYCODES):
-            macropad.keyboard.send(*KEYCODES[idx])
+        combo = KEYCODES.get(event.key_number)
+        if combo:
+            macropad.keyboard.send(*combo)
+
+    position = macropad.encoder
+    if position != last_encoder:
+        delta = position - last_encoder
+        code = ConsumerControlCode.VOLUME_INCREMENT if delta > 0 else ConsumerControlCode.VOLUME_DECREMENT
+        for _ in range(abs(delta)):
+            macropad.consumer_control.send(code)
+        last_encoder = position
+
+    switch = macropad.encoder_switch
+    if switch and not last_switch:
+        macropad.consumer_control.send(ConsumerControlCode.MUTE)
+    last_switch = switch
 
     if serial and serial.in_waiting:
         buf += serial.read(serial.in_waiting)
