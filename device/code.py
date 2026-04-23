@@ -22,7 +22,8 @@ PASTE_KEY = 10
 SCREENSHOT_KEY = 11
 
 FLASH_COLOR = (255, 255, 255)
-FLASH_DURATION = 0.35  # seconds — how long to fade back to UTILITY
+FLASH_DURATION = 0.35  # seconds — one-shot fade back to UTILITY on key press
+PULSE_PERIOD = 1.2     # seconds — breathing cycle while slurp is active
 
 KEYCODES = {
     0: (Keycode.GUI, Keycode.ONE),
@@ -67,6 +68,7 @@ buf = b""
 last_encoder = macropad.encoder
 last_switch = macropad.encoder_switch
 flash_start = None
+pulse_mode = False  # toggled by host when slurp opens/closes its layer
 
 while True:
     event = macropad.keys.events.get()
@@ -74,12 +76,17 @@ while True:
         combo = KEYCODES.get(event.key_number)
         if combo:
             macropad.keyboard.send(*combo)
-        if event.key_number == SCREENSHOT_KEY:
+        if event.key_number == SCREENSHOT_KEY and not pulse_mode:
             flash_start = time.monotonic()
             macropad.pixels[SCREENSHOT_KEY] = FLASH_COLOR
             macropad.pixels.show()
 
-    if flash_start is not None:
+    if pulse_mode:
+        phase = (time.monotonic() % PULSE_PERIOD) / PULSE_PERIOD
+        tri = phase * 2 if phase < 0.5 else (1 - phase) * 2
+        macropad.pixels[SCREENSHOT_KEY] = lerp(UTILITY, FLASH_COLOR, tri)
+        macropad.pixels.show()
+    elif flash_start is not None:
         elapsed = time.monotonic() - flash_start
         if elapsed >= FLASH_DURATION:
             macropad.pixels[SCREENSHOT_KEY] = UTILITY
@@ -107,6 +114,14 @@ while True:
         while b"\n" in buf:
             line, buf = buf.split(b"\n", 1)
             line = line.strip()
-            # Protocol: b"S" + 6 ASCII chars, each '0' (empty) / '1' (occupied) / '2' (active)
+            # Protocol:
+            #   S<6 chars>  — workspace state, each '0' (empty) / '1' (occupied) / '2' (active)
+            #   F<0|1>      — pulse the screenshot key on (slurp active) / off
             if len(line) >= 7 and line[0:1] == b"S":
                 paint(line[1:7])
+            elif len(line) >= 2 and line[0:1] == b"F":
+                pulse_mode = line[1:2] == b"1"
+                if not pulse_mode:
+                    flash_start = None
+                    macropad.pixels[SCREENSHOT_KEY] = UTILITY
+                    macropad.pixels.show()

@@ -2,9 +2,11 @@
 """Bridge Hyprland workspace state to the Adafruit Macropad LEDs.
 
 Listens on Hyprland's event socket, recomputes per-workspace state on each
-relevant event, and pushes a 7-byte frame (`Sxxxxxx\n`) over the macropad's
-USB CDC data port. Each digit encodes one workspace slot:
-  '0' empty, '1' occupied (has windows), '2' active on focused monitor.
+relevant event, and pushes frames over the macropad's USB CDC data port.
+
+Protocol (line-delimited):
+  S<6 digits>  — per-workspace state, each '0' (empty) / '1' (occupied) / '2' (active)
+  F<0|1>       — pulse the screenshot key on / off (reflects slurp layer open)
 """
 import json
 import os
@@ -28,6 +30,10 @@ RELEVANT_EVENTS = {
     "destroyworkspace",
     "moveworkspace",
 }
+
+# slurp's layer-shell namespace (default). If you use a screenshot tool
+# that wraps slurp under a different name, add its namespace here.
+SLURP_LAYER_NAMESPACES = {"selection", "slurp"}
 
 TTY_CANDIDATES = ["/dev/macropad"] + [f"/dev/ttyACM{i}" for i in range(10)]
 
@@ -114,6 +120,8 @@ def push(link):
 
 def run():
     link = MacropadLink()
+    pulse_on = False
+
     while True:
         try:
             sock = connect_event_socket()
@@ -123,6 +131,8 @@ def run():
             continue
 
         push(link)
+        link.write(b"F0\n")
+        pulse_on = False
         buf = b""
         try:
             while True:
@@ -133,9 +143,18 @@ def run():
                 dirty = False
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
-                    event = line.split(b">>", 1)[0].decode(errors="replace")
-                    if event in RELEVANT_EVENTS:
+                    event, _, payload = line.partition(b">>")
+                    event_s = event.decode(errors="replace")
+                    if event_s in RELEVANT_EVENTS:
                         dirty = True
+                    if event_s == "openlayer" and payload.decode(errors="replace") in SLURP_LAYER_NAMESPACES:
+                        if not pulse_on:
+                            link.write(b"F1\n")
+                            pulse_on = True
+                    elif event_s == "closelayer" and payload.decode(errors="replace") in SLURP_LAYER_NAMESPACES:
+                        if pulse_on:
+                            link.write(b"F0\n")
+                            pulse_on = False
                 if dirty:
                     push(link)
         except OSError as e:
