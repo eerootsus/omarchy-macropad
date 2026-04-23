@@ -3,12 +3,13 @@ from adafruit_hid.keycode import Keycode
 from adafruit_macropad import MacroPad
 
 macropad = MacroPad()
-macropad.pixels.brightness = 0.3
+macropad.pixels.brightness = 1.0
 macropad.pixels.auto_write = False
 
-OFF = (0, 0, 0)
-GREEN = (40, 220, 20)
-WHITE = (255, 255, 255)
+# Brightness is encoded directly in the tuples: 255 = 100% on that channel.
+ACTIVE = (128, 0, 0)     # focused workspace — red @ 50%
+OCCUPIED = (0, 0, 128)   # has windows — blue @ 50%
+MAPPED = (0, 0, 20)      # empty but bound — very dim blue, visible as a "this key does something" hint
 
 # Top two rows of the 3x4 grid map to workspaces 1..6.
 WORKSPACE_KEYS = (0, 1, 2, 3, 4, 5)
@@ -23,15 +24,15 @@ KEYCODES = (
 )
 
 STATE_COLORS = {
-    ord("0"): OFF,
-    ord("1"): GREEN,
-    ord("2"): WHITE,
+    ord("0"): MAPPED,
+    ord("1"): OCCUPIED,
+    ord("2"): ACTIVE,
 }
 
 
 def paint(states):
     for i, key in enumerate(WORKSPACE_KEYS):
-        macropad.pixels[key] = STATE_COLORS.get(states[i], OFF)
+        macropad.pixels[key] = STATE_COLORS.get(states[i], MAPPED)
     macropad.pixels.show()
 
 
