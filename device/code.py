@@ -1,3 +1,5 @@
+import time
+
 import usb_cdc
 from adafruit_hid.consumer_control_code import ConsumerControlCode
 from adafruit_hid.keycode import Keycode
@@ -17,6 +19,10 @@ UTILITY = (25, 12, 0)    # copy/paste "mapped" hint — dim amber, contrasts wit
 WORKSPACE_KEYS = (0, 1, 2, 3, 4, 5)
 COPY_KEY = 9
 PASTE_KEY = 10
+SCREENSHOT_KEY = 11
+
+FLASH_COLOR = (255, 255, 255)
+FLASH_DURATION = 0.35  # seconds — how long to fade back to UTILITY
 
 KEYCODES = {
     0: (Keycode.GUI, Keycode.ONE),
@@ -27,6 +33,7 @@ KEYCODES = {
     5: (Keycode.GUI, Keycode.SIX),
     COPY_KEY: (Keycode.CONTROL, Keycode.SHIFT, Keycode.C),
     PASTE_KEY: (Keycode.CONTROL, Keycode.SHIFT, Keycode.V),
+    SCREENSHOT_KEY: (Keycode.GUI, Keycode.SHIFT, Keycode.S),
 }
 
 STATE_COLORS = {
@@ -41,7 +48,16 @@ def paint(states):
         macropad.pixels[key] = STATE_COLORS.get(states[i], MAPPED)
     macropad.pixels[COPY_KEY] = UTILITY
     macropad.pixels[PASTE_KEY] = UTILITY
+    macropad.pixels[SCREENSHOT_KEY] = UTILITY
     macropad.pixels.show()
+
+
+def lerp(a, b, t):
+    return (
+        int(a[0] + (b[0] - a[0]) * t),
+        int(a[1] + (b[1] - a[1]) * t),
+        int(a[2] + (b[2] - a[2]) * t),
+    )
 
 
 paint(b"000000")
@@ -50,6 +66,7 @@ serial = usb_cdc.data
 buf = b""
 last_encoder = macropad.encoder
 last_switch = macropad.encoder_switch
+flash_start = None
 
 while True:
     event = macropad.keys.events.get()
@@ -57,6 +74,20 @@ while True:
         combo = KEYCODES.get(event.key_number)
         if combo:
             macropad.keyboard.send(*combo)
+        if event.key_number == SCREENSHOT_KEY:
+            flash_start = time.monotonic()
+            macropad.pixels[SCREENSHOT_KEY] = FLASH_COLOR
+            macropad.pixels.show()
+
+    if flash_start is not None:
+        elapsed = time.monotonic() - flash_start
+        if elapsed >= FLASH_DURATION:
+            macropad.pixels[SCREENSHOT_KEY] = UTILITY
+            macropad.pixels.show()
+            flash_start = None
+        else:
+            macropad.pixels[SCREENSHOT_KEY] = lerp(FLASH_COLOR, UTILITY, elapsed / FLASH_DURATION)
+            macropad.pixels.show()
 
     position = macropad.encoder
     if position != last_encoder:
