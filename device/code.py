@@ -8,6 +8,7 @@ from adafruit_macropad import MacroPad
 macropad = MacroPad()
 macropad.pixels.brightness = 1.0
 macropad.pixels.auto_write = False
+macropad.display_sleep = True  # OLED is unused; keep it off
 
 # Brightness is encoded directly in the tuples: 255 = 100% on that channel.
 ACTIVE = (128, 0, 0)        # focused workspace — red @ 50%
@@ -59,6 +60,7 @@ last_encoder = macropad.encoder
 last_switch = macropad.encoder_switch
 flash_start = None
 pulse_mode = False  # toggled by host when slurp opens/closes its layer
+blanked = False     # toggled by host on suspend/lock; keeps all LEDs dark
 workspace_states = bytearray(b"000000")
 last_render = 0.0
 
@@ -92,15 +94,24 @@ while True:
             # Protocol:
             #   S<6 chars>  — workspace state, each '0' (empty) / '1' (occupied) / '2' (active)
             #   F<0|1>      — pulse the screenshot key on (slurp active) / off
+            #   B<0|1>      — blank all LEDs on (suspend/lock) / off
             if len(line) >= 7 and line[0:1] == b"S":
                 workspace_states[:] = line[1:7]
             elif len(line) >= 2 and line[0:1] == b"F":
                 pulse_mode = line[1:2] == b"1"
                 if not pulse_mode:
                     flash_start = None
+            elif len(line) >= 2 and line[0:1] == b"B":
+                new_blanked = line[1:2] == b"1"
+                if new_blanked and not blanked:
+                    for i in range(12):
+                        macropad.pixels[i] = (0, 0, 0)
+                    macropad.pixels.show()
+                    flash_start = None
+                blanked = new_blanked
 
     now = time.monotonic()
-    if now - last_render >= RENDER_INTERVAL:
+    if not blanked and now - last_render >= RENDER_INTERVAL:
         last_render = now
 
         occupied_color = lerp(OCCUPIED_LOW, OCCUPIED_HIGH, triangle(now, OCCUPIED_PERIOD))

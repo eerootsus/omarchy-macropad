@@ -3,13 +3,17 @@
 
 Listens on Hyprland's event socket, recomputes per-workspace state on each
 relevant event, and pushes frames over the macropad's USB CDC data port.
+Also listens on systemd-logind (via `gdbus monitor`) to blank the LEDs
+while the session is locked or the system is suspending/resuming.
 
 Protocol (line-delimited):
   S<6 digits>  — per-workspace state, each '0' (empty) / '1' (occupied) / '2' (active)
   F<0|1>       — pulse the screenshot key on / off (reflects slurp layer open)
+  B<0|1>       — blank all LEDs on / off (reflects lock / suspend)
 """
 import json
 import os
+import selectors
 import socket
 import subprocess
 import sys
@@ -36,6 +40,11 @@ RELEVANT_EVENTS = {
 SLURP_LAYER_NAMESPACES = {"selection", "slurp"}
 
 TTY_CANDIDATES = ["/dev/macropad"] + [f"/dev/ttyACM{i}" for i in range(10)]
+
+# `gdbus monitor` emits one signal per line, e.g.
+#   /org/freedesktop/login1: org.freedesktop.login1.Manager.PrepareForSleep (true,)
+#   /org/freedesktop/login1/session/_32: org.freedesktop.login1.Session.Lock ()
+DBUS_MONITOR_CMD = ["gdbus", "monitor", "--system", "--dest", "org.freedesktop.login1"]
 
 
 def log(msg):
@@ -118,53 +127,134 @@ def push(link):
         log(f"hyprctl failed: {e}")
 
 
+def parse_dbus_line(line):
+    """Map a `gdbus monitor` line to 'blank' / 'unblank' / None."""
+    if "PrepareForSleep (true" in line:
+        return "blank"
+    if "PrepareForSleep (false" in line:
+        return "unblank"
+    if ".Session.Lock ()" in line:
+        return "blank"
+    if ".Session.Unlock ()" in line:
+        return "unblank"
+    return None
+
+
+def spawn_dbus_monitor():
+    try:
+        return subprocess.Popen(
+            DBUS_MONITOR_CMD,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=0,
+        )
+    except (FileNotFoundError, OSError) as e:
+        log(f"gdbus monitor unavailable, sleep/lock blanking disabled: {e}")
+        return None
+
+
 def run():
     link = MacropadLink()
     pulse_on = False
+    blanked = False
+
+    sel = selectors.DefaultSelector()
+    dbus = spawn_dbus_monitor()
+    if dbus is not None:
+        sel.register(dbus.stdout.fileno(), selectors.EVENT_READ, "dbus")
+    dbus_buf = b""
+
+    sock = None
+    hypr_buf = b""
 
     while True:
+        if sock is None:
+            try:
+                sock = connect_event_socket()
+            except (FileNotFoundError, ConnectionRefusedError, RuntimeError) as e:
+                log(f"waiting for Hyprland: {e}")
+                time.sleep(2)
+                continue
+            sel.register(sock.fileno(), selectors.EVENT_READ, "hypr")
+            hypr_buf = b""
+            if not blanked:
+                push(link)
+            link.write(b"F0\n")
+            pulse_on = False
+
         try:
-            sock = connect_event_socket()
-        except (FileNotFoundError, ConnectionRefusedError, RuntimeError) as e:
-            log(f"waiting for Hyprland: {e}")
-            time.sleep(2)
+            events = sel.select(timeout=None)
+        except OSError as e:
+            log(f"select error: {e}")
+            time.sleep(1)
             continue
 
-        push(link)
-        link.write(b"F0\n")
-        pulse_on = False
-        buf = b""
-        try:
-            while True:
-                data = sock.recv(4096)
+        for key, _ in events:
+            if key.data == "hypr":
+                try:
+                    data = sock.recv(4096)
+                except OSError as e:
+                    log(f"event socket error: {e}")
+                    data = b""
                 if not data:
+                    sel.unregister(sock.fileno())
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                    sock = None
+                    time.sleep(1)
                     break
-                buf += data
+                hypr_buf += data
                 dirty = False
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
+                while b"\n" in hypr_buf:
+                    line, hypr_buf = hypr_buf.split(b"\n", 1)
                     event, _, payload = line.partition(b">>")
                     event_s = event.decode(errors="replace")
+                    payload_s = payload.decode(errors="replace")
                     if event_s in RELEVANT_EVENTS:
                         dirty = True
-                    if event_s == "openlayer" and payload.decode(errors="replace") in SLURP_LAYER_NAMESPACES:
+                    if event_s == "openlayer" and payload_s in SLURP_LAYER_NAMESPACES:
                         if not pulse_on:
                             link.write(b"F1\n")
                             pulse_on = True
-                    elif event_s == "closelayer" and payload.decode(errors="replace") in SLURP_LAYER_NAMESPACES:
+                    elif event_s == "closelayer" and payload_s in SLURP_LAYER_NAMESPACES:
                         if pulse_on:
                             link.write(b"F0\n")
                             pulse_on = False
-                if dirty:
+                if dirty and not blanked:
                     push(link)
-        except OSError as e:
-            log(f"event socket error: {e}")
-        finally:
-            try:
-                sock.close()
-            except OSError:
-                pass
-        time.sleep(1)
+            elif key.data == "dbus":
+                try:
+                    data = os.read(dbus.stdout.fileno(), 4096)
+                except OSError as e:
+                    log(f"dbus read error: {e}")
+                    data = b""
+                if not data:
+                    log("gdbus monitor exited; restarting")
+                    sel.unregister(dbus.stdout.fileno())
+                    try:
+                        dbus.terminate()
+                    except OSError:
+                        pass
+                    dbus = spawn_dbus_monitor()
+                    dbus_buf = b""
+                    if dbus is not None:
+                        sel.register(dbus.stdout.fileno(), selectors.EVENT_READ, "dbus")
+                    continue
+                dbus_buf += data
+                while b"\n" in dbus_buf:
+                    line, dbus_buf = dbus_buf.split(b"\n", 1)
+                    action = parse_dbus_line(line.decode(errors="replace"))
+                    if action == "blank" and not blanked:
+                        blanked = True
+                        link.write(b"B1\n")
+                        log("blanked")
+                    elif action == "unblank" and blanked:
+                        blanked = False
+                        link.write(b"B0\n")
+                        push(link)
+                        log("unblanked")
 
 
 if __name__ == "__main__":
