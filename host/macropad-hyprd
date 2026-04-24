@@ -137,6 +137,12 @@ def parse_dbus_line(line):
         return "blank"
     if ".Session.Unlock ()" in line:
         return "unblank"
+    # hyprlock (and other lockers) don't call Session.Unlock() on auth —
+    # they flip the LockedHint property instead. Track that so we notice.
+    if "'LockedHint': <true>" in line:
+        return "blank"
+    if "'LockedHint': <false>" in line:
+        return "unblank"
     return None
 
 
