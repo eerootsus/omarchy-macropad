@@ -3,8 +3,8 @@
 
 Listens on Hyprland's event socket, recomputes per-workspace state on each
 relevant event, and pushes frames over the macropad's USB CDC data port.
-Also listens on systemd-logind (via `gdbus monitor`) to blank the LEDs
-while the session is locked or the system is suspending/resuming.
+Also blanks the LEDs while hyprlock is running (lock screen) or the system
+is suspending; resume / unlock restores them.
 
 Protocol (line-delimited):
   S<6 digits>  — per-workspace state, each '0' (empty) / '1' (occupied) / '2' (active)
@@ -41,10 +41,14 @@ SLURP_LAYER_NAMESPACES = {"selection", "slurp"}
 
 TTY_CANDIDATES = ["/dev/macropad"] + [f"/dev/ttyACM{i}" for i in range(10)]
 
-# `gdbus monitor` emits one signal per line, e.g.
+# `gdbus monitor` emits one signal per line; we only care about
 #   /org/freedesktop/login1: org.freedesktop.login1.Manager.PrepareForSleep (true,)
-#   /org/freedesktop/login1/session/_32: org.freedesktop.login1.Session.Lock ()
+# Session.Lock / Session.Unlock and LockedHint are unreliable: omarchy's
+# manual lock hotkey skips loginctl, and hyprlock 0.9 doesn't touch
+# LockedHint either, so lock state is detected by polling for hyprlock
+# instead.
 DBUS_MONITOR_CMD = ["gdbus", "monitor", "--system", "--dest", "org.freedesktop.login1"]
+LOCK_POLL_INTERVAL = 2.0  # seconds — how fast we react to hyprlock start/stop
 
 
 def log(msg):
@@ -127,23 +131,21 @@ def push(link):
         log(f"hyprctl failed: {e}")
 
 
-def parse_dbus_line(line):
-    """Map a `gdbus monitor` line to 'blank' / 'unblank' / None."""
+def parse_sleep_line(line):
+    """Return True/False on PrepareForSleep transitions, None otherwise."""
     if "PrepareForSleep (true" in line:
-        return "blank"
+        return True
     if "PrepareForSleep (false" in line:
-        return "unblank"
-    if ".Session.Lock ()" in line:
-        return "blank"
-    if ".Session.Unlock ()" in line:
-        return "unblank"
-    # hyprlock (and other lockers) don't call Session.Unlock() on auth —
-    # they flip the LockedHint property instead. Track that so we notice.
-    if "'LockedHint': <true>" in line:
-        return "blank"
-    if "'LockedHint': <false>" in line:
-        return "unblank"
+        return False
     return None
+
+
+def hyprlock_running():
+    return subprocess.run(
+        ["pgrep", "-x", "hyprlock"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ).returncode == 0
 
 
 def spawn_dbus_monitor():
@@ -163,6 +165,7 @@ def run():
     link = MacropadLink()
     pulse_on = False
     blanked = False
+    sleeping = False
 
     sel = selectors.DefaultSelector()
     dbus = spawn_dbus_monitor()
@@ -172,6 +175,20 @@ def run():
 
     sock = None
     hypr_buf = b""
+
+    def reconcile():
+        nonlocal blanked
+        desired = sleeping or hyprlock_running()
+        if desired == blanked:
+            return
+        blanked = desired
+        if blanked:
+            link.write(b"B1\n")
+            log("blanked")
+        else:
+            link.write(b"B0\n")
+            push(link)
+            log("unblanked")
 
     while True:
         if sock is None:
@@ -183,13 +200,14 @@ def run():
                 continue
             sel.register(sock.fileno(), selectors.EVENT_READ, "hypr")
             hypr_buf = b""
+            reconcile()
             if not blanked:
                 push(link)
             link.write(b"F0\n")
             pulse_on = False
 
         try:
-            events = sel.select(timeout=None)
+            events = sel.select(timeout=LOCK_POLL_INTERVAL)
         except OSError as e:
             log(f"select error: {e}")
             time.sleep(1)
@@ -251,16 +269,11 @@ def run():
                 dbus_buf += data
                 while b"\n" in dbus_buf:
                     line, dbus_buf = dbus_buf.split(b"\n", 1)
-                    action = parse_dbus_line(line.decode(errors="replace"))
-                    if action == "blank" and not blanked:
-                        blanked = True
-                        link.write(b"B1\n")
-                        log("blanked")
-                    elif action == "unblank" and blanked:
-                        blanked = False
-                        link.write(b"B0\n")
-                        push(link)
-                        log("unblanked")
+                    state = parse_sleep_line(line.decode(errors="replace"))
+                    if state is not None:
+                        sleeping = state
+
+        reconcile()
 
 
 if __name__ == "__main__":
