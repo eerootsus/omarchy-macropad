@@ -1,3 +1,4 @@
+import gc
 import time
 
 import usb_cdc
@@ -28,6 +29,9 @@ FLASH_DURATION = 0.35      # seconds — one-shot fade back to UTILITY on key pr
 PULSE_PERIOD = 1.2         # seconds — breathing cycle while slurp is active
 OCCUPIED_PERIOD = 2.5      # seconds — breathing cycle for occupied workspaces
 RENDER_INTERVAL = 1 / 30   # cap pixel updates at ~30fps
+HOST_TIMEOUT = 5.0         # seconds — blank if host stops sending heartbeats
+GC_INTERVAL = 5.0          # seconds — periodic GC to fight heap fragmentation
+MAX_BUF = 256              # bytes — cap unparsed serial buffer; drop on overflow
 
 KEYCODES = {
     0: (Keycode.GUI, Keycode.ONE),
@@ -61,8 +65,11 @@ last_switch = macropad.encoder_switch
 flash_start = None
 pulse_mode = False  # toggled by host when slurp opens/closes its layer
 blanked = False     # toggled by host on suspend/lock; keeps all LEDs dark
+host_silent = False # set when no heartbeat for HOST_TIMEOUT; treat like blanked
 workspace_states = bytearray(b"000000")
 last_render = 0.0
+last_gc = 0.0
+last_host_seen = time.monotonic()
 
 while True:
     event = macropad.keys.events.get()
@@ -88,6 +95,9 @@ while True:
 
     if serial and serial.in_waiting:
         buf += serial.read(serial.in_waiting)
+        last_host_seen = time.monotonic()
+        if len(buf) > MAX_BUF:
+            buf = b""
         while b"\n" in buf:
             line, buf = buf.split(b"\n", 1)
             line = line.strip()
@@ -95,6 +105,7 @@ while True:
             #   S<6 chars>  — workspace state, each '0' (empty) / '1' (occupied) / '2' (active)
             #   F<0|1>      — pulse the screenshot key on (slurp active) / off
             #   B<0|1>      — blank all LEDs on (suspend/lock) / off
+            #   H           — heartbeat; presence already bumped last_host_seen
             if len(line) >= 7 and line[0:1] == b"S":
                 workspace_states[:] = line[1:7]
             elif len(line) >= 2 and line[0:1] == b"F":
@@ -111,7 +122,19 @@ while True:
                 blanked = new_blanked
 
     now = time.monotonic()
-    if not blanked and now - last_render >= RENDER_INTERVAL:
+    if now - last_gc >= GC_INTERVAL:
+        gc.collect()
+        last_gc = now
+
+    silent = now - last_host_seen > HOST_TIMEOUT
+    if silent and not host_silent:
+        for i in range(12):
+            macropad.pixels[i] = (0, 0, 0)
+        macropad.pixels.show()
+        flash_start = None
+    host_silent = silent
+
+    if not blanked and not host_silent and now - last_render >= RENDER_INTERVAL:
         last_render = now
 
         occupied_color = lerp(OCCUPIED_LOW, OCCUPIED_HIGH, triangle(now, OCCUPIED_PERIOD))

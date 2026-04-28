@@ -10,6 +10,7 @@ Protocol (line-delimited):
   S<6 digits>  — per-workspace state, each '0' (empty) / '1' (occupied) / '2' (active)
   F<0|1>       — pulse the screenshot key on / off (reflects slurp layer open)
   B<0|1>       — blank all LEDs on / off (reflects lock / suspend)
+  H            — heartbeat; device blanks itself if it stops hearing from us
 """
 import json
 import os
@@ -49,6 +50,7 @@ TTY_CANDIDATES = ["/dev/macropad"] + [f"/dev/ttyACM{i}" for i in range(10)]
 # instead.
 DBUS_MONITOR_CMD = ["gdbus", "monitor", "--system", "--dest", "org.freedesktop.login1"]
 LOCK_POLL_INTERVAL = 2.0  # seconds — how fast we react to hyprlock start/stop
+HEARTBEAT_INTERVAL = 2.0  # seconds — keep device's host-alive watchdog happy
 
 
 def log(msg):
@@ -166,6 +168,7 @@ def run():
     pulse_on = False
     blanked = False
     sleeping = False
+    last_heartbeat = 0.0
 
     sel = selectors.DefaultSelector()
     dbus = spawn_dbus_monitor()
@@ -200,11 +203,15 @@ def run():
                 continue
             sel.register(sock.fileno(), selectors.EVENT_READ, "hypr")
             hypr_buf = b""
+            # Force device state explicitly — it may have stale blanked/pulse
+            # from a previous host instance that exited mid-state.
+            blanked = False
+            pulse_on = False
+            link.write(b"F0\n")
+            link.write(b"B0\n")
             reconcile()
             if not blanked:
                 push(link)
-            link.write(b"F0\n")
-            pulse_on = False
 
         try:
             events = sel.select(timeout=LOCK_POLL_INTERVAL)
@@ -274,6 +281,11 @@ def run():
                         sleeping = state
 
         reconcile()
+
+        now = time.monotonic()
+        if now - last_heartbeat >= HEARTBEAT_INTERVAL:
+            link.write(b"H\n")
+            last_heartbeat = now
 
 
 if __name__ == "__main__":
